@@ -444,11 +444,14 @@ struct Parts<T> {
     off: Vec<u32>, // NB + 1
 }
 impl<T: Copy> Parts<T> {
-    fn build(v: Vec<T>, key: impl Fn(&T) -> usize) -> Parts<T> {
+    fn build(v: &[T], key: impl Fn(&T) -> usize) -> Parts<T> {
+        with_scratch(&S_BS, |bs| Self::build_with(v, key, bs))
+    }
+    fn build_with(v: &[T], key: impl Fn(&T) -> usize, bs: &mut Vec<u16>) -> Parts<T> {
         const W: usize = 8; // records per write-combining buffer
         let mut cnt = vec![0u32; NB + 1];
-        let bs: Vec<u16> = v.iter().map(|x| key(x) as u16).collect();
-        for &b in &bs {
+        bs.extend(v.iter().map(|x| key(x) as u16));
+        for &b in bs.iter() {
             cnt[b as usize + 1] += 1;
         }
         for i in 0..NB {
@@ -461,7 +464,7 @@ impl<T: Copy> Parts<T> {
         let mut fill = vec![0u8; NB];
         unsafe {
             let p = data.as_mut_ptr();
-            for (x, &b) in v.iter().zip(&bs) {
+            for (x, &b) in v.iter().zip(bs.iter()) {
                 let b = b as usize;
                 let f = fill.get_unchecked_mut(b);
                 wc.get_unchecked_mut(b)[*f as usize].write(*x);
@@ -489,13 +492,35 @@ impl<T: Copy> Parts<T> {
     }
 }
 
-fn gather<T: Copy + Send + Sync>(parts: &[Parts<T>], b: usize) -> Vec<T> {
+fn gather_into<T: Copy>(parts: &[Parts<T>], b: usize, v: &mut Vec<T>) {
     let n: usize = parts.iter().map(|p| p.get(b).len()).sum();
-    let mut v = Vec::with_capacity(n);
+    v.clear();
+    v.reserve(n);
     for p in parts {
         v.extend_from_slice(p.get(b));
     }
-    v
+}
+
+// Per-thread scratch buffers: reusing them avoids faulting in fresh zeroed pages.
+use std::cell::RefCell;
+use std::thread::LocalKey;
+thread_local! {
+    static S_RAW: RefCell<Vec<RawEv>> = const { RefCell::new(Vec::new()) };
+    static S_EV: RefCell<Vec<Ev>> = const { RefCell::new(Vec::new()) };
+    static S_EV2: RefCell<Vec<Ev>> = const { RefCell::new(Vec::new()) };
+    static S_CK: RefCell<Vec<Ck>> = const { RefCell::new(Vec::new()) };
+    static S_CK2: RefCell<Vec<Ck>> = const { RefCell::new(Vec::new()) };
+    static S_BS: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
+}
+fn with_scratch<T: 'static, R>(key: &'static LocalKey<RefCell<Vec<T>>>, f: impl FnOnce(&mut Vec<T>) -> R) -> R {
+    key.with(|c| {
+        let mut v = c.take();
+        v.clear();
+        let r = f(&mut v);
+        v.clear();
+        c.replace(v);
+        r
+    })
 }
 
 // ---------------------------------------------------------------- records
@@ -580,7 +605,11 @@ struct Ctx {
 }
 
 fn parse_events(chunk: B, cx: &Ctx) -> Parts<RawEv> {
-    let mut v: Vec<RawEv> = Vec::with_capacity(chunk.len() / 64 + 16);
+    with_scratch(&S_RAW, |v| parse_events_into(chunk, cx, v))
+}
+
+fn parse_events_into(chunk: B, cx: &Ctx, v: &mut Vec<RawEv>) -> Parts<RawEv> {
+    v.reserve(chunk.len() / 64 + 16);
     let mut dc = Dates::new();
     let ws_s = cx.ws.div_euclid(1000);
     scan::<7>(chunk, |f| {
@@ -637,7 +666,11 @@ fn parse_events(chunk: B, cx: &Ctx) -> Parts<RawEv> {
 }
 
 fn parse_clicks(chunk: B, cx: &Ctx) -> Parts<Ck> {
-    let mut v: Vec<Ck> = Vec::with_capacity(chunk.len() / 40 + 16);
+    with_scratch(&S_CK, |v| parse_clicks_into(chunk, cx, v))
+}
+
+fn parse_clicks_into(chunk: B, cx: &Ctx, v: &mut Vec<Ck>) -> Parts<Ck> {
+    v.reserve(chunk.len() / 40 + 16);
     let mut dc = Dates::new();
     let lo = cx.ws - WEEK_MS;
     scan::<4>(chunk, |f| {
@@ -684,7 +717,8 @@ fn dedup(parsed: &[Parts<RawEv>], b: usize) -> Parts<Ev> {
             }
         }
     }
-    let mut out: Vec<Ev> = Vec::with_capacity(n);
+    with_scratch(&S_EV, |out| {
+    out.reserve(n);
     for &s in &slots {
         if s.is_null() {
             continue;
@@ -696,6 +730,7 @@ fn dedup(parsed: &[Parts<RawEv>], b: usize) -> Parts<Ev> {
         out.push(Ev { name: r.user, key: r.tsoff as u64, price: r.price, cat: r.cat, purchase: r.flags & 2 != 0 });
     }
     Parts::build(out, |e| bucket(e.name))
+    })
 }
 
 // ---------------------------------------------------------------- sessions + attribution
@@ -746,20 +781,21 @@ fn pk_c(c: &Ck) -> (u64, u64, K) {
 }
 
 /// Counting sort on the low 12 bits of the person hash, then small sorts per group.
-fn group_sort<T: Copy>(v: Vec<T>, key: impl Fn(&T) -> u64, sort: impl Fn(&mut [T])) -> Vec<T> {
+fn group_sort<T: Copy>(v: &[T], out: &mut Vec<T>, key: impl Fn(&T) -> u64, sort: impl Fn(&mut [T])) {
     const SB: usize = 4096;
-    let mut cnt = vec![0u32; SB + 1];
-    for x in &v {
+    let mut cnt = [0u32; SB + 1];
+    for x in v {
         cnt[((key(x) >> 32) & 0xFFF) as usize + 1] += 1;
     }
     for i in 0..SB {
         cnt[i + 1] += cnt[i];
     }
-    let mut pos = cnt.clone();
-    let mut out: Vec<T> = Vec::with_capacity(v.len());
+    let mut pos = cnt;
+    out.clear();
+    out.reserve(v.len());
     unsafe {
         let p = out.as_mut_ptr();
-        for x in &v {
+        for x in v {
             let i = pos.get_unchecked_mut(((key(x) >> 32) & 0xFFF) as usize);
             p.add(*i as usize).write(*x);
             *i += 1;
@@ -772,12 +808,25 @@ fn group_sort<T: Copy>(v: Vec<T>, key: impl Fn(&T) -> u64, sort: impl Fn(&mut [T
             sort(&mut out[a..b]);
         }
     }
-    out
 }
 
-fn process_bucket(evs: Vec<Ev>, cks: Vec<Ck>, sh: &Shared, acc: &mut Acc) {
-    let mut evs = group_sort(evs, |e| e.key, |s| s.sort_unstable_by_key(|e| e.key));
-    let mut cks = group_sort(cks, |c| c.key, |s| s.sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| cmp_key(a.cid, b.cid))));
+fn process_bucket(pev: &[Parts<Ev>], pck: &[Parts<Ck>], b: usize, sh: &Shared, acc: &mut Acc) {
+    with_scratch(&S_EV, |e1| {
+        with_scratch(&S_EV2, |e2| {
+            with_scratch(&S_CK, |c1| {
+                with_scratch(&S_CK2, |c2| {
+                    gather_into(pev, b, e1);
+                    gather_into(pck, b, c1);
+                    group_sort(e1, e2, |e| e.key, |s| s.sort_unstable_by_key(|e| e.key));
+                    group_sort(c1, c2, |c| c.key, |s| s.sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| cmp_key(a.cid, b.cid))));
+                    process_sorted(e2, c2, sh, acc);
+                })
+            })
+        })
+    })
+}
+
+fn process_sorted(evs: &mut [Ev], cks: &mut [Ck], sh: &Shared, acc: &mut Acc) {
     // Two people with the same 32-bit hash would interleave: fall back to a full sort.
     let clash_e = evs.windows(2).any(|w| w[0].key >> 32 == w[1].key >> 32 && w[0].name != w[1].name);
     let clash_c = cks.windows(2).any(|w| w[0].key >> 32 == w[1].key >> 32 && w[0].name != w[1].name);
@@ -971,7 +1020,7 @@ fn build_links(chunks: &[B]) -> Links {
         }
     }
     let entries: Vec<(K, K)> = (0..n).map(|i| (ids[i], best[root[i] as usize])).collect();
-    let entries = Parts::build(entries, |e| bucket(e.0));
+    let entries = Parts::build(&entries, |e| bucket(e.0));
     let tables: Vec<Vec<u32>> = (0..NB).into_par_iter().map(|b| build_table(entries.get(b), |e| e.0)).collect();
     Links { entries, tables }
 }
@@ -1001,6 +1050,8 @@ fn main() {
     unsafe {
         // Back large allocations with transparent huge pages.
         libmimalloc_sys::mi_option_set(libmimalloc_sys::mi_option_large_os_pages, 1);
+        // mi_option_purge_delay (v2 enum value 15): never return freed memory, so it is reused without re-faulting
+        libmimalloc_sys::mi_option_set(15, -1);
     }
     if let Some(n) = std::env::var("NCPU").ok().and_then(|v| v.parse::<usize>().ok()) {
         let _ = rayon::ThreadPoolBuilder::new().num_threads(n.max(1)).build_global();
@@ -1081,7 +1132,7 @@ fn main() {
             let parsed: Vec<Parts<RawEv>> = ev_chunks.par_iter().map(|c| parse_events(c, &cx)).collect();
             lap("events parsed");
             let deduped: Vec<Parts<Ev>> = (0..NB).into_par_iter().map(|b| dedup(&parsed, b)).collect();
-            std::mem::forget(parsed);
+            drop(parsed);
             lap("deduped");
             let clicks: Vec<Parts<Ck>> = ck_chunks.par_iter().map(|c| parse_clicks(c, &cx)).collect();
             lap("clicks parsed");
@@ -1094,21 +1145,27 @@ fn main() {
     let resolved: Vec<(Parts<Ev>, Parts<Ck>)> = (0..NB)
         .into_par_iter()
         .map(|b| {
-            let mut e = gather(&deduped, b);
-            for x in e.iter_mut() {
-                x.name = links.name_in(b, x.name);
-                x.key |= h32(x.name) << 32;
-            }
-            let mut c = gather(&clicks, b);
-            for x in c.iter_mut() {
-                x.name = links.name_in(b, x.name);
-                x.key |= h32(x.name) << 32;
-            }
-            (Parts::build(e, |x| bucket(x.name)), Parts::build(c, |x| bucket(x.name)))
+            let pe = with_scratch(&S_EV, |e| {
+                gather_into(&deduped, b, e);
+                for x in e.iter_mut() {
+                    x.name = links.name_in(b, x.name);
+                    x.key |= h32(x.name) << 32;
+                }
+                Parts::build(e, |x| bucket(x.name))
+            });
+            let pc = with_scratch(&S_CK, |c| {
+                gather_into(&clicks, b, c);
+                for x in c.iter_mut() {
+                    x.name = links.name_in(b, x.name);
+                    x.key |= h32(x.name) << 32;
+                }
+                Parts::build(c, |x| bucket(x.name))
+            });
+            (pe, pc)
         })
         .collect();
-    std::mem::forget(deduped);
-    std::mem::forget(clicks);
+    drop(deduped);
+    drop(clicks);
     let (pev, pck): (Vec<Parts<Ev>>, Vec<Parts<Ck>>) = resolved.into_iter().unzip();
     lap("resolved");
 
@@ -1121,7 +1178,7 @@ fn main() {
         .fold(
             || Acc { camps: vec![CampAgg::default(); ncamp * ndays], cnt: vec![0; ncamp], active: Vec::new(), users: Vec::new() },
             |mut acc, b| {
-                process_bucket(gather(&pev, b), gather(&pck, b), &sh, &mut acc);
+                process_bucket(&pev, &pck, b, &sh, &mut acc);
                 acc
             },
         )
