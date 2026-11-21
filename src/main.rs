@@ -40,11 +40,21 @@ fn long_table() -> &'static Mutex<AHashMap<K, Box<[u8]>>> {
 
 #[inline(always)]
 fn pack(b: &[u8], keep: bool) -> K {
-    if b.len() <= 15 {
-        let mut buf = [0u8; 16];
-        buf[..b.len()].copy_from_slice(b);
-        buf[15] = b.len() as u8;
-        let v = u128::from_be_bytes(buf);
+    let len = b.len();
+    if len <= 15 {
+        let ptr = b.as_ptr();
+        let v = if len == 0 {
+            0u128
+        } else if (ptr as usize & 4095) <= 4096 - 16 {
+            // The 16-byte read stays inside the page holding the field, so it is mapped.
+            let raw = unsafe { std::ptr::read_unaligned(ptr as *const [u8; 16]) };
+            u128::from_be_bytes(raw) & (!0u128 << (8 * (16 - len)))
+        } else {
+            let mut buf = [0u8; 16];
+            buf[..len].copy_from_slice(b);
+            u128::from_be_bytes(buf)
+        };
+        let v = v | len as u128;
         ((v >> 64) as u64, v as u64)
     } else {
         pack_long(b, keep)
