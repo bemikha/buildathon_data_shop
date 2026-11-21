@@ -561,7 +561,6 @@ dependencies = [
  "ahash",
  "arrow-array",
  "arrow-schema",
- "libc",
  "libmimalloc-sys",
  "memchr",
  "memmap2",
