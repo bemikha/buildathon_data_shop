@@ -448,6 +448,26 @@ fn price_ok(b: &[u8]) -> Option<u32> {
 
 // ---------------------------------------------------------------- partitioning
 
+
+/// Copies `n` records with non-temporal stores: the destination is written without
+/// first being read into the cache (no read-for-ownership on fresh memory).
+#[inline(always)]
+unsafe fn stream_copy<T>(src: *const T, dst: *mut T, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::mem::size_of::<T>() % 8 == 0 && std::mem::align_of::<T>() >= 8 {
+            let words = n * std::mem::size_of::<T>() / 8;
+            let s = src as *const i64;
+            let d = dst as *mut i64;
+            for k in 0..words {
+                std::arch::x86_64::_mm_stream_si64(d.add(k), *s.add(k));
+            }
+            return;
+        }
+    }
+    std::ptr::copy_nonoverlapping(src, dst, n);
+}
+
 /// A vector grouped into NB contiguous buckets.
 struct Parts<T> {
     data: Vec<T>,
@@ -481,7 +501,7 @@ impl<T: Copy> Parts<T> {
                 *f += 1;
                 if *f as usize == W {
                     let d = pos.get_unchecked_mut(b);
-                    std::ptr::copy_nonoverlapping(wc.get_unchecked(b).as_ptr() as *const T, p.add(*d as usize), W);
+                    stream_copy(wc.get_unchecked(b).as_ptr() as *const T, p.add(*d as usize), W);
                     *d += W as u32;
                     *f = 0;
                 }
@@ -493,12 +513,78 @@ impl<T: Copy> Parts<T> {
                 }
             }
             data.set_len(v.len());
+            #[cfg(target_arch = "x86_64")]
+            std::arch::x86_64::_mm_sfence();
         }
         Parts { data, off: cnt }
     }
     #[inline]
     fn get(&self, b: usize) -> &[T] {
         &self.data[self.off[b] as usize..self.off[b + 1] as usize]
+    }
+}
+
+/// Records grouped into NB buckets, one vector per bucket, filled through per-bucket
+/// write-combining buffers flushed with non-temporal stores (no scratch copy, no
+/// counting pass).
+struct BParts<T> {
+    b: Vec<Vec<T>>,
+}
+impl<T: Copy> BParts<T> {
+    #[inline]
+    fn get(&self, b: usize) -> &[T] {
+        &self.b[b]
+    }
+}
+
+const WCN: usize = 8;
+
+struct Writer<T> {
+    parts: Vec<Vec<T>>,
+    wc: Vec<[std::mem::MaybeUninit<T>; WCN]>,
+    fill: Vec<u8>,
+}
+impl<T: Copy> Writer<T> {
+    fn new(total_hint: usize) -> Self {
+        let each = total_hint / NB + total_hint / NB / 3 + 16;
+        let mut wc = Vec::with_capacity(NB);
+        unsafe { wc.set_len(NB) };
+        Writer { parts: (0..NB).map(|_| Vec::with_capacity(each)).collect(), wc, fill: vec![0; NB] }
+    }
+    #[inline(always)]
+    fn push(&mut self, bk: usize, x: T) {
+        unsafe {
+            let f = self.fill.get_unchecked_mut(bk);
+            self.wc.get_unchecked_mut(bk)[*f as usize].write(x);
+            *f += 1;
+            if *f as usize == WCN {
+                *f = 0;
+                let v = self.parts.get_unchecked_mut(bk);
+                if v.capacity() - v.len() < WCN {
+                    v.reserve(v.len().max(WCN));
+                }
+                stream_copy(self.wc.get_unchecked(bk).as_ptr() as *const T, v.as_mut_ptr().add(v.len()), WCN);
+                v.set_len(v.len() + WCN);
+            }
+        }
+    }
+    fn finish(mut self) -> BParts<T> {
+        for bk in 0..NB {
+            let f = self.fill[bk] as usize;
+            if f > 0 {
+                let v = &mut self.parts[bk];
+                v.reserve(f);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.wc[bk].as_ptr() as *const T, v.as_mut_ptr().add(v.len()), f);
+                    v.set_len(v.len() + f);
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
+        BParts { b: self.parts }
     }
 }
 
@@ -515,8 +601,6 @@ fn gather_into<T: Copy>(parts: &[Parts<T>], b: usize, v: &mut Vec<T>) {
 use std::cell::RefCell;
 use std::thread::LocalKey;
 thread_local! {
-    static S_KEY: RefCell<Vec<KeyRec>> = const { RefCell::new(Vec::new()) };
-    static S_PAY: RefCell<Vec<Pay>> = const { RefCell::new(Vec::new()) };
     static S_EV: RefCell<Vec<Ev>> = const { RefCell::new(Vec::new()) };
     static S_EV2: RefCell<Vec<Ev>> = const { RefCell::new(Vec::new()) };
     static S_CK: RefCell<Vec<Ck>> = const { RefCell::new(Vec::new()) };
@@ -556,8 +640,9 @@ struct Pay {
 }
 
 struct ParsedChunk {
-    keys: Parts<KeyRec>,
-    pays: Parts<Pay>,
+    keys: BParts<KeyRec>,
+    pays: BParts<Pay>,
+    off: Vec<u32>, // payload index of each user bucket's first payload
     win: Vec<std::sync::atomic::AtomicU64>, // dedup winners, by payload index
 }
 
@@ -629,12 +714,9 @@ struct Ctx {
 }
 
 fn parse_events(chunk: B, cx: &Ctx) -> ParsedChunk {
-    with_scratch(&S_KEY, |k| with_scratch(&S_PAY, |p| parse_events_into(chunk, cx, k, p)))
-}
-
-fn parse_events_into(chunk: B, cx: &Ctx, keys: &mut Vec<KeyRec>, pays: &mut Vec<Pay>) -> ParsedChunk {
-    keys.reserve(chunk.len() / 64 + 16);
-    pays.reserve(chunk.len() / 64 + 16);
+    let est = chunk.len() / 70 + 16;
+    let mut keys: Writer<KeyRec> = Writer::new(est);
+    let mut pays: Writer<Pay> = Writer::new(est);
     let mut rank = vec![0u32; NB];
     let mut dc = Dates::new();
     let ws_s = cx.ws.div_euclid(1000);
@@ -684,20 +766,19 @@ fn parse_events_into(chunk: B, cx: &Ctx, keys: &mut Vec<KeyRec>, pays: &mut Vec<
             // position after grouping by user bucket = offset of ub + rank within ub
             kr.loc = (ub as u32) << 22 | rank[ub];
             rank[ub] += 1;
-            pays.push(Pay { user, tsoff: (ts - cx.ws) as u32, pc });
+            pays.push(ub, Pay { user, tsoff: (ts - cx.ws) as u32, pc });
         }
-        keys.push(kr);
+        keys.push(bucket(kr.eid), kr);
     });
     assert!(rank.iter().all(|&r| r < 1 << 22));
-    let pays = Parts::build(pays, |p| bucket(p.user));
-    for k in keys.iter_mut() {
-        if k.loc != u32::MAX {
-            k.loc = pays.off[(k.loc >> 22) as usize] + (k.loc & ((1 << 22) - 1));
-        }
+    let pays = pays.finish();
+    let keys = keys.finish();
+    let mut off = vec![0u32; NB + 1];
+    for i in 0..NB {
+        off[i + 1] = off[i] + pays.get(i).len() as u32;
     }
-    let keys = Parts::build(keys, |k| bucket(k.eid));
-    let win = (0..pays.data.len() / 64 + 1).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
-    ParsedChunk { keys, pays, win }
+    let win = (0..off[NB] as usize / 64 + 1).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    ParsedChunk { keys, pays, off, win }
 }
 
 fn parse_clicks(chunk: B, cx: &Ctx) -> Parts<Ck> {
@@ -760,7 +841,9 @@ fn dedup(chunks: &[ParsedChunk], b: usize) {
         }
         let loc = rec(s).loc;
         if loc != u32::MAX {
-            chunks[(s >> 32) as usize].win[(loc >> 6) as usize].fetch_or(1 << (loc & 63), std::sync::atomic::Ordering::Relaxed);
+            let ch = &chunks[(s >> 32) as usize];
+            let pos = ch.off[(loc >> 22) as usize] + (loc & ((1 << 22) - 1));
+            ch.win[(pos >> 6) as usize].fetch_or(1 << (pos & 63), std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -1182,7 +1265,7 @@ fn main() {
                 let n: usize = chunks.iter().map(|c| c.pays.get(b).len()).sum();
                 e.reserve(n);
                 for ch in &chunks {
-                    let base = ch.pays.off[b] as usize;
+                    let base = ch.off[b] as usize;
                     for (i, p) in ch.pays.get(b).iter().enumerate() {
                         let pos = base + i;
                         if (ch.win[pos >> 6].load(std::sync::atomic::Ordering::Relaxed) >> (pos & 63)) & 1 == 0 {
