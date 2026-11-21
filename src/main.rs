@@ -469,6 +469,7 @@ impl<T: Copy> Parts<T> {
         }
         let mut pos = cnt.clone();
         let mut data: Vec<T> = Vec::with_capacity(v.len());
+        prefault(&mut data);
         let mut wc: Vec<[std::mem::MaybeUninit<T>; W]> = Vec::with_capacity(NB);
         unsafe { wc.set_len(NB) };
         let mut fill = vec![0u8; NB];
@@ -502,10 +503,31 @@ impl<T: Copy> Parts<T> {
     }
 }
 
+
+/// Maps the spare capacity of a vector in one call (MADV_POPULATE_WRITE) instead of
+/// taking a page fault per 4 KiB page; harmless where it is unsupported.
+#[inline]
+fn prefault<T>(v: &mut Vec<T>) {
+    let bytes = (v.capacity() - v.len()) * std::mem::size_of::<T>();
+    if bytes < (256 << 10) {
+        return;
+    }
+    let start = unsafe { v.as_mut_ptr().add(v.len()) } as usize;
+    let page = 4096usize;
+    let a = (start + page - 1) & !(page - 1);
+    let e = (start + bytes) & !(page - 1);
+    if e > a {
+        unsafe {
+            libc::madvise(a as *mut libc::c_void, e - a, 23 /* MADV_POPULATE_WRITE */);
+        }
+    }
+}
+
 fn gather_into<T: Copy>(parts: &[Parts<T>], b: usize, v: &mut Vec<T>) {
     let n: usize = parts.iter().map(|p| p.get(b).len()).sum();
     v.clear();
     v.reserve(n);
+    prefault(v);
     for p in parts {
         v.extend_from_slice(p.get(b));
     }
@@ -566,44 +588,51 @@ struct Ck {
     camp: u32,
 }
 
+/// id -> person, as one flat open-addressing table with the entries inline, so a
+/// lookup costs one cache miss; lookups are issued in prefetched batches.
 struct Links {
-    entries: Parts<(K, K)>, // (id, person) grouped by bucket(id)
-    tables: Vec<Vec<u32>>,  // per bucket: open addressing over entries
+    slots: Vec<(K, K)>, // (id, person); (0, 0) = empty (never a packed key)
+    mask: usize,
 }
 impl Links {
-    /// Resolves an id that falls in bucket b.
     #[inline(always)]
-    fn name_in(&self, b: usize, id: K) -> K {
-        let t = &self.tables[b];
-        let e = self.entries.get(b);
-        let mask = t.len() - 1;
-        let mut h = (mix(id) as usize) & mask;
+    fn slot(&self, id: K) -> usize {
+        (mix(id) as usize) & self.mask
+    }
+    #[inline(always)]
+    fn prefetch(&self, id: K) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.slots.as_ptr().add(self.slot(id)) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
+    fn get(&self, id: K) -> K {
+        let mut h = self.slot(id);
         loop {
-            let s = t[h];
-            if s == u32::MAX {
-                return id;
-            }
-            let (k, n) = e[s as usize];
+            let (k, n) = unsafe { *self.slots.get_unchecked(h) };
             if k == id {
                 return n;
             }
-            h = (h + 1) & mask;
+            if k == (0, 0) {
+                return id;
+            }
+            h = (h + 1) & self.mask;
         }
     }
-}
-
-fn build_table<T>(items: &[T], key: impl Fn(&T) -> K) -> Vec<u32> {
-    let cap = (items.len() * 2).next_power_of_two().max(8);
-    let mask = cap - 1;
-    let mut t = vec![u32::MAX; cap];
-    for (i, x) in items.iter().enumerate() {
-        let mut h = (mix(key(x)) as usize) & mask;
-        while t[h] != u32::MAX {
-            h = (h + 1) & mask;
+    /// Maps every id in `ids` (in place) to its person, 16 prefetched lookups at a time.
+    fn resolve<T>(&self, xs: &mut [T], get: impl Fn(&T) -> K, set: impl Fn(&mut T, K)) {
+        for c in xs.chunks_mut(16) {
+            for x in c.iter() {
+                self.prefetch(get(x));
+            }
+            for x in c.iter_mut() {
+                let n = self.get(get(x));
+                set(x, n);
+            }
         }
-        t[h] = i as u32;
     }
-    t
 }
 
 struct Ctx {
@@ -620,6 +649,7 @@ fn parse_events(chunk: B, cx: &Ctx) -> Parts<RawEv> {
 
 fn parse_events_into(chunk: B, cx: &Ctx, v: &mut Vec<RawEv>) -> Parts<RawEv> {
     v.reserve(chunk.len() / 64 + 16);
+    prefault(v);
     let mut dc = Dates::new();
     let ws_s = cx.ws.div_euclid(1000);
     scan::<7>(chunk, |f| {
@@ -675,12 +705,13 @@ fn parse_events_into(chunk: B, cx: &Ctx, v: &mut Vec<RawEv>) -> Parts<RawEv> {
     Parts::build(v, |r| bucket(r.eid))
 }
 
-fn parse_clicks(chunk: B, cx: &Ctx) -> Parts<Ck> {
-    with_scratch(&S_CK, |v| parse_clicks_into(chunk, cx, v))
+fn parse_clicks(chunk: B, cx: &Ctx, links: &Links) -> Parts<Ck> {
+    with_scratch(&S_CK, |v| parse_clicks_into(chunk, cx, v, links))
 }
 
-fn parse_clicks_into(chunk: B, cx: &Ctx, v: &mut Vec<Ck>) -> Parts<Ck> {
+fn parse_clicks_into(chunk: B, cx: &Ctx, v: &mut Vec<Ck>, links: &Links) -> Parts<Ck> {
     v.reserve(chunk.len() / 40 + 16);
+    prefault(v);
     let mut dc = Dates::new();
     let lo = cx.ws - WEEK_MS;
     scan::<4>(chunk, |f| {
@@ -697,16 +728,22 @@ fn parse_clicks_into(chunk: B, cx: &Ctx, v: &mut Vec<Ck>) -> Parts<Ck> {
         };
         v.push(Ck { name: pack(f[1], true), cid: pack(f[0], true), key: (ts - lo) as u64, camp });
     });
+    links.resolve(v, |c| c.name, |c, n| {
+        c.name = n;
+        c.key |= h32(n) << 32;
+    });
     Parts::build(v, |c| bucket(c.name))
 }
 
 /// Dedup one event_id bucket: keep the copy with the smallest ingest_ts, then drop
 /// invalid ones. Survivors are grouped by bucket(user_id) for the partition join.
-fn dedup(parsed: &[Parts<RawEv>], b: usize) -> Parts<Ev> {
+fn dedup(parsed: &[Parts<RawEv>], b: usize, links: &Links) -> Parts<Ev> {
     let n: usize = parsed.iter().map(|p| p.get(b).len()).sum();
     let cap = (n * 2).next_power_of_two().max(16);
     let mask = cap - 1;
-    let mut slots: Vec<*const RawEv> = vec![std::ptr::null(); cap];
+    let mut slots: Vec<*const RawEv> = Vec::with_capacity(cap);
+    prefault(&mut slots);
+    slots.resize(cap, std::ptr::null());
     for p in parsed {
         for r in p.get(b) {
             let mut h = (mix(r.eid) as usize) & mask;
@@ -729,6 +766,7 @@ fn dedup(parsed: &[Parts<RawEv>], b: usize) -> Parts<Ev> {
     }
     with_scratch(&S_EV, |out| {
     out.reserve(n);
+    prefault(out);
     for &s in &slots {
         if s.is_null() {
             continue;
@@ -739,6 +777,10 @@ fn dedup(parsed: &[Parts<RawEv>], b: usize) -> Parts<Ev> {
         }
         out.push(Ev { name: r.user, key: r.tsoff as u64, price: r.price, cat: r.cat, purchase: r.flags & 2 != 0 });
     }
+    links.resolve(out, |e| e.name, |e, n| {
+        e.name = n;
+        e.key |= h32(n) << 32;
+    });
     Parts::build(out, |e| bucket(e.name))
     })
 }
@@ -803,6 +845,7 @@ fn group_sort<T: Copy>(v: &[T], out: &mut Vec<T>, key: impl Fn(&T) -> u64, sort:
     let mut pos = cnt;
     out.clear();
     out.reserve(v.len());
+    prefault(out);
     unsafe {
         let p = out.as_mut_ptr();
         for x in v {
@@ -1030,9 +1073,16 @@ fn build_links(chunks: &[B]) -> Links {
         }
     }
     let entries: Vec<(K, K)> = (0..n).map(|i| (ids[i], best[root[i] as usize])).collect();
-    let entries = Parts::build(&entries, |e| bucket(e.0));
-    let tables: Vec<Vec<u32>> = (0..NB).into_par_iter().map(|b| build_table(entries.get(b), |e| e.0)).collect();
-    Links { entries, tables }
+    let cap = (n * 2).next_power_of_two().max(16);
+    let mut links = Links { slots: vec![((0, 0), (0, 0)); cap], mask: cap - 1 };
+    for &(id, nm) in &entries {
+        let mut h = links.slot(id);
+        while links.slots[h].0 != (0, 0) {
+            h = (h + 1) & links.mask;
+        }
+        links.slots[h] = (id, nm);
+    }
+    links
 }
 
 // ---------------------------------------------------------------- parquet
@@ -1135,49 +1185,18 @@ fn main() {
     camp_names.push((b"organic".to_vec(), b"organic".to_vec()));
     let cx = Ctx { ws, we, products, unknown_cat, campaigns };
 
-    // Links run alongside event parsing and dedup, which do not need them.
-    let (links, (deduped, clicks)) = rayon::join(
+    // Links are built alongside event parsing, which does not need them.
+    let (links, parsed) = rayon::join(
         || build_links(&link_chunks),
-        || {
-            let parsed: Vec<Parts<RawEv>> = ev_chunks.par_iter().map(|c| parse_events(c, &cx)).collect();
-            lap("events parsed");
-            let deduped: Vec<Parts<Ev>> = (0..NB).into_par_iter().map(|b| dedup(&parsed, b)).collect();
-            drop(parsed);
-            lap("deduped");
-            let clicks: Vec<Parts<Ck>> = ck_chunks.par_iter().map(|c| parse_clicks(c, &cx)).collect();
-            lap("clicks parsed");
-            (deduped, clicks)
-        },
+        || ev_chunks.par_iter().map(|c| parse_events(c, &cx)).collect::<Vec<Parts<RawEv>>>(),
     );
-    lap("links ready");
-
-    // Partition join: resolve ids to people bucket by bucket, regroup by person.
-    let resolved: Vec<(Parts<Ev>, Parts<Ck>)> = (0..NB)
-        .into_par_iter()
-        .map(|b| {
-            let pe = with_scratch(&S_EV, |e| {
-                gather_into(&deduped, b, e);
-                for x in e.iter_mut() {
-                    x.name = links.name_in(b, x.name);
-                    x.key |= h32(x.name) << 32;
-                }
-                Parts::build(e, |x| bucket(x.name))
-            });
-            let pc = with_scratch(&S_CK, |c| {
-                gather_into(&clicks, b, c);
-                for x in c.iter_mut() {
-                    x.name = links.name_in(b, x.name);
-                    x.key |= h32(x.name) << 32;
-                }
-                Parts::build(c, |x| bucket(x.name))
-            });
-            (pe, pc)
-        })
-        .collect();
-    drop(deduped);
-    drop(clicks);
-    let (pev, pck): (Vec<Parts<Ev>>, Vec<Parts<Ck>>) = resolved.into_iter().unzip();
-    lap("resolved");
+    lap("events parsed + links");
+    let (pev, pck): (Vec<Parts<Ev>>, Vec<Parts<Ck>>) = rayon::join(
+        || (0..NB).into_par_iter().map(|b| dedup(&parsed, b, &links)).collect(),
+        || ck_chunks.par_iter().map(|c| parse_clicks(c, &cx, &links)).collect(),
+    );
+    drop(parsed);
+    lap("deduped + clicks");
 
     let day0 = ws.div_euclid(DAY_MS) as i32;
     let ndays = ((we - 1).div_euclid(DAY_MS) as i32 - day0 + 1) as usize;
