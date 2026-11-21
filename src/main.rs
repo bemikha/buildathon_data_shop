@@ -126,7 +126,8 @@ fn map_file(p: &Path) -> B {
         return &[];
     }
     let m = unsafe { memmap2::MmapOptions::new().map(&f) }.unwrap_or_else(|e| panic!("mmap {p:?}: {e}"));
-    let _ = m.advise(memmap2::Advice::WillNeed);
+    // No madvise(WillNeed): let the parallel scan fault pages lazily so the disk
+    // read overlaps with parse compute instead of adding a separate full pass.
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
     &m[..]
 }
@@ -175,7 +176,20 @@ fn chunks_of(files: &[PathBuf], target: usize) -> Vec<B> {
 
 #[inline(always)]
 fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let nl = _mm512_set1_epi8(b'\n' as i8);
+        let cm = _mm512_set1_epi8(b',' as i8);
+        let qt = _mm512_set1_epi8(b'"' as i8);
+        let v = _mm512_loadu_si512(p.as_ptr() as *const __m512i);
+        return (
+            _mm512_cmpeq_epi8_mask(v, nl) as u64,
+            _mm512_cmpeq_epi8_mask(v, cm) as u64,
+            _mm512_cmpeq_epi8_mask(v, qt) as u64,
+        );
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
     unsafe {
         use std::arch::x86_64::*;
         let nl = _mm256_set1_epi8(b'\n' as i8);
@@ -399,6 +413,17 @@ fn parse_ts(b: &[u8], dc: &mut Dates) -> Option<i64> {
     }
     let days = dc.get(b)?;
     Some((days * 86_400 + h * 3600 + mi * 60 + s) * 1000 - off_ms)
+}
+
+/// ingest_ts is always form F1 (`write_utc`): `YYYY-MM-DDTHH:MM:SSZ`, always valid.
+/// Parse it without any format/validation checks.
+#[inline(always)]
+fn parse_ingest(b: &[u8], dc: &mut Dates) -> i64 {
+    let days = dc.get(b).unwrap();
+    let h = (b[11].wrapping_sub(b'0') * 10 + b[12].wrapping_sub(b'0')) as i64;
+    let mi = (b[14].wrapping_sub(b'0') * 10 + b[15].wrapping_sub(b'0')) as i64;
+    let s = (b[17].wrapping_sub(b'0') * 10 + b[18].wrapping_sub(b'0')) as i64;
+    (days * 86_400 + h * 3600 + mi * 60 + s) * 1000
 }
 
 #[inline(always)]
@@ -724,10 +749,7 @@ fn parse_events(chunk: B, cx: &Ctx) -> ParsedChunk {
         if f[0].is_empty() {
             return;
         }
-        let ingest = match parse_ts(f[3], &mut dc) {
-            Some(t) => t,
-            None => return, // ingest_ts is always valid F1
-        };
+        let ingest = parse_ingest(f[3], &mut dc);
         let mut kr = KeyRec {
             eid: pack(f[0], false),
             ingest: (ingest.div_euclid(1000) - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
