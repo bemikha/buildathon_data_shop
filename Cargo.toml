@@ -1,0 +1,22 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rayon = "1.12"
+memmap2 = "0.9"
+memchr = "2.8"
+ahash = "0.8"
+arrow-array = "60"
+arrow-schema = "60"
+parquet = { version = "60", default-features = false, features = ["arrow"] }
+mimalloc = { version = "0.1.52", features = ["extended"] }
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
