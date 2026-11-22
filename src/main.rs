@@ -1025,7 +1025,7 @@ fn parse_events(chunk: B, cx: &Ctx) -> ParsedChunk {
     let mut rank = vec![0u32; NB];
     let mut dc = Dates::new();
     let ws_s = cx.ws.div_euclid(1000);
-    scan::<7>(chunk, |f| {
+    scan_lines::<7>(chunk, |f| {
         if f[0].is_empty() {
             return;
         }
