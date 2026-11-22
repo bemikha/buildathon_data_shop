@@ -1046,13 +1046,9 @@ fn parse_events(chunk: B, cx: &Ctx) -> ParsedChunk {
                 Some(t) if t >= cx.ws && t < cx.we => t,
                 _ => break 'v,
             };
-            let t = f[4];
-            let purchase = match t.len() {
-                8 if u64::from_le_bytes(t.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") => true,
-                4 if {
-                    let w = u32::from_le_bytes(t.try_into().unwrap());
-                    w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart")
-                } => false,
+            let purchase = match f[4] {
+                b"purchase" => true,
+                b"view" | b"cart" => false,
                 _ => break 'v,
             };
             let mut pc = 0u32;
@@ -1779,15 +1775,13 @@ fn main() {
             });
             let pc = with_scratch(&S_CK, |c| {
                 with_scratch(&S_BS, |bs| {
-                    let n: usize = clicks.iter().map(|p| p.get(b).len()).sum();
-                    c.reserve(n);
-                    bs.reserve(n);
-                    for cp in &clicks {
-                        for x in cp.get(b) {
-                            let (name, hn) = links.name_hash_in(b, x.name, mix(x.name));
-                            c.push(Ck { name, cid: x.cid, key: x.key | (hn & 0xFFFF_FFFF) << 32, camp: x.camp });
-                            bs.push((hn >> (64 - NB_BITS)) as u16);
-                        }
+                    gather_into(&clicks, b, c);
+                    bs.reserve(c.len());
+                    for x in c.iter_mut() {
+                        let (name, hn) = links.name_hash_in(b, x.name, mix(x.name));
+                        x.name = name;
+                        x.key |= (hn & 0xFFFF_FFFF) << 32;
+                        bs.push((hn >> (64 - NB_BITS)) as u16);
                     }
                     Parts::build_pre(c, bs)
                 })
@@ -1840,13 +1834,7 @@ fn main() {
                     nb.append_value(std::str::from_utf8(&b).unwrap_or("\u{FFFD}"));
                 } else {
                     let v = (((r.name.0 as u128) << 64) | r.name.1 as u128).to_be_bytes();
-                    let bytes = &v[..v[15] as usize];
-                    if u128::from_be_bytes(v) & 0x8080_8080_8080_8080_8080_8080_8080_8000 == 0 {
-                        // ASCII (the length byte is masked out): valid UTF-8
-                        nb.append_value(unsafe { std::str::from_utf8_unchecked(bytes) });
-                    } else {
-                        nb.append_value(std::str::from_utf8(bytes).unwrap_or("\u{FFFD}"));
-                    }
+                    nb.append_value(std::str::from_utf8(&v[..v[15] as usize]).unwrap_or("\u{FFFD}"));
                 }
             }
             let batch = RecordBatch::try_from_iter(vec![
