@@ -1667,7 +1667,7 @@ fn main() {
     let ((ev_chunks, ck_chunks), link_chunks) = rayon::join(
         || {
             rayon::join(
-                || chunks_of(&csv_files(&data.join("events")), 8 << 20),
+                || chunks_of(&csv_files(&data.join("events")), 16 << 20),
                 || chunks_of(&csv_files(&data.join("clicks")), 8 << 20),
             )
         },
