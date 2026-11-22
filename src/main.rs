@@ -32,10 +32,49 @@ const WEEK_MS: i64 = 7 * DAY_MS;
 const NB_BITS: u32 = 10;
 const NB: usize = 1 << NB_BITS;
 
-static LONG: OnceLock<Mutex<AHashMap<K, Box<[u8]>>>> = OnceLock::new();
+/// Bytes of long keys, sharded by hash so threads rarely contend. Values point into the
+/// input mappings, which live until exit.
+const LSH: usize = 256;
+static LONG: OnceLock<Vec<Mutex<AHashMap<K, B>>>> = OnceLock::new();
 
-fn long_table() -> &'static Mutex<AHashMap<K, Box<[u8]>>> {
-    LONG.get_or_init(|| Mutex::new(AHashMap::new()))
+fn long_shard(k: K) -> &'static Mutex<AHashMap<K, B>> {
+    let t = LONG.get_or_init(|| (0..LSH).map(|_| Mutex::new(AHashMap::new())).collect());
+    &t[(k.0 >> 56) as usize % LSH]
+}
+
+thread_local! {
+    /// Direct-mapped cache of long keys this thread already registered.
+    static LONG_SEEN: RefCell<Vec<K>> = RefCell::new(vec![(0, 0); 4096]);
+}
+
+/// 128-bit hash of a byte string, one pass, two independent multiply-rotate lanes.
+#[inline]
+fn hash128(b: &[u8]) -> (u64, u64) {
+    let mut a = 0x243F_6A88_85A3_08D3u64 ^ b.len() as u64;
+    let mut c = 0x1319_8A2E_0370_7344u64 ^ (b.len() as u64).rotate_left(32);
+    let mut i = 0;
+    while i + 8 <= b.len() {
+        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        a = (a ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+        c = (c ^ w).wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(31);
+        i += 8;
+    }
+    if i < b.len() {
+        let mut t = [0u8; 8];
+        t[..b.len() - i].copy_from_slice(&b[i..]);
+        let w = u64::from_le_bytes(t) ^ 0x8000_0000_0000_0000;
+        a = (a ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+        c = (c ^ w).wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(31);
+    }
+    let f = |mut x: u64| {
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^ (x >> 33)
+    };
+    let (fa, fc) = (f(a ^ c.rotate_left(17)), f(c ^ a.rotate_left(41)));
+    (fa, fc)
 }
 
 #[inline(always)]
@@ -61,26 +100,51 @@ fn pack(b: &[u8], keep: bool) -> K {
     }
 }
 
-#[cold]
 #[inline(never)]
 fn pack_long(b: &[u8], keep: bool) -> K {
-    let h1 = ahash::RandomState::with_seeds(1, 2, 3, 4).hash_one(b);
-    let h2 = ahash::RandomState::with_seeds(5, 6, 7, 8).hash_one(b);
+    let (h1, h2) = hash128(b);
     let k = (h1, h2 | 0xFF);
     if keep {
-        long_table().lock().unwrap().entry(k).or_insert_with(|| b.into());
+        // Fields are slices of the input mappings, which are never unmapped.
+        let st: B = unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) };
+        LONG_SEEN.with(|s| {
+            let mut s = s.borrow_mut();
+            let slot = (k.0 >> 52) as usize & 4095;
+            if s[slot] != k {
+                s[slot] = k;
+                long_shard(k).lock().unwrap().entry(k).or_insert(st);
+            }
+        });
     }
     k
 }
 
 #[inline(always)]
 fn is_long(k: K) -> bool {
-    k.1 & 0xFF == 0xFF
+    k.1 & 0xFF >= 0xFE
+}
+
+/// A click_id: ids up to 15 bytes are packed; a longer one keeps a pointer to its bytes
+/// in the input mapping (low byte 0xFE). Click ids are only ever compared, never hashed.
+#[inline(always)]
+fn pack_cid(b: &[u8]) -> K {
+    if b.len() <= 15 {
+        pack(b, false)
+    } else {
+        (b.as_ptr() as u64, (b.len() as u64) << 8 | 0xFE)
+    }
+}
+
+fn long_bytes(k: K) -> B {
+    if k.1 & 0xFF == 0xFE {
+        return unsafe { std::slice::from_raw_parts(k.0 as *const u8, (k.1 >> 8) as usize) };
+    }
+    long_shard(k).lock().unwrap().get(&k).copied().unwrap_or(&[])
 }
 
 fn key_bytes(k: K) -> Vec<u8> {
     if is_long(k) {
-        long_table().lock().unwrap().get(&k).map(|b| b.to_vec()).unwrap_or_default()
+        long_bytes(k).to_vec()
     } else {
         let v = ((k.0 as u128) << 64) | k.1 as u128;
         let buf = v.to_be_bytes();
@@ -92,6 +156,8 @@ fn key_bytes(k: K) -> Vec<u8> {
 fn cmp_key(a: K, b: K) -> Ordering {
     if !is_long(a) && !is_long(b) {
         a.cmp(&b)
+    } else if is_long(a) && is_long(b) {
+        long_bytes(a).cmp(long_bytes(b))
     } else {
         key_bytes(a).cmp(&key_bytes(b))
     }
@@ -874,6 +940,7 @@ struct Pay {
 struct ParsedChunk {
     keys: BParts<KeyRec>,
     pays: BParts<Pay>,
+    longs: BParts<(K, B)>, // (key, bytes) of every long user_id seen, by user bucket
     off: Vec<u32>, // payload index of each user bucket's first payload
     win: Vec<std::sync::atomic::AtomicU64>, // dedup winners, by payload index
 }
@@ -954,6 +1021,7 @@ fn parse_events(chunk: B, cx: &Ctx) -> ParsedChunk {
     let est = chunk.len() / 70 + 16;
     let mut keys: Writer<KeyRec> = Writer::new(est);
     let mut pays: Writer<Pay> = Writer::new(est);
+    let mut longs: Writer<(K, B)> = Writer::new(est / 4);
     let mut rank = vec![0u32; NB];
     let mut dc = Dates::new();
     let ws_s = cx.ws.div_euclid(1000);
@@ -998,8 +1066,12 @@ fn parse_events(chunk: B, cx: &Ctx) -> ParsedChunk {
             if ingest - ts > DAY_MS {
                 break 'v;
             }
-            let user = pack(f[1], true);
+            let user = pack(f[1], false);
             let ub = bucket(user);
+            if is_long(user) {
+                // bytes of long ids are registered later, once per id, per user bucket
+                longs.push(ub, (user, unsafe { std::slice::from_raw_parts(f[1].as_ptr(), f[1].len()) }));
+            }
             // position after grouping by user bucket = offset of ub + rank within ub
             kr.loc = (ub as u32) << 22 | rank[ub];
             rank[ub] += 1;
@@ -1010,12 +1082,13 @@ fn parse_events(chunk: B, cx: &Ctx) -> ParsedChunk {
     assert!(rank.iter().all(|&r| r < 1 << 22));
     let pays = pays.finish();
     let keys = keys.finish();
+    let longs = longs.finish();
     let mut off = vec![0u32; NB + 1];
     for i in 0..NB {
         off[i + 1] = off[i] + pays.get(i).len() as u32;
     }
     let win = (0..off[NB] as usize / 64 + 1).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
-    ParsedChunk { keys, pays, off, win }
+    ParsedChunk { keys, pays, longs, off, win }
 }
 
 fn parse_clicks(chunk: B, cx: &Ctx) -> Parts<Ck> {
@@ -1038,7 +1111,7 @@ fn parse_clicks_into(chunk: B, cx: &Ctx, v: &mut Vec<Ck>) -> Parts<Ck> {
             Some(t) if t >= lo && t < cx.we => t,
             _ => return,
         };
-        v.push(Ck { name: pack(f[1], true), cid: pack(f[0], true), key: (ts - lo) as u64, camp });
+        v.push(Ck { name: pack(f[1], false), cid: pack_cid(f[0]), key: (ts - lo) as u64, camp });
     });
     Parts::build(v, |c| bucket(c.name))
 }
@@ -1668,6 +1741,17 @@ fn main() {
     let resolved: Vec<(Parts<Ev>, Parts<Ck>)> = (0..NB)
         .into_par_iter()
         .map(|b| {
+            // register the bytes of this bucket's long user ids, once each
+            {
+                let mut seen: ahash::AHashSet<K> = ahash::AHashSet::new();
+                for ch in &chunks {
+                    for &(k, bytes) in ch.longs.get(b) {
+                        if seen.insert(k) {
+                            long_shard(k).lock().unwrap().entry(k).or_insert(bytes);
+                        }
+                    }
+                }
+            }
             let pe = with_scratch(&S_EV, |e| {
                 with_scratch(&S_BS, |bs| {
                     let n: usize = chunks.iter().map(|c| c.pays.get(b).len()).sum();
